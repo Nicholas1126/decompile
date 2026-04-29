@@ -1,0 +1,14 @@
+# Build artifacts
+*.pyc
+__pycache__/
+
+# Test binaries
+test/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
