@@ -6,8 +6,11 @@ Detects file type via magic bytes and routes to the appropriate decompiler:
   - .NET DLL/EXE     → ILSpy CLI
   - JAR / .class     → CFR
 
-Output: <original_filename>.cpp in output directory
-  e.g. test.dll → test.dll.cpp, test.jar → test.jar.cpp
+Output naming by file type:
+  - ELF / native PE  → <name>.cpp        (e.g. test → test.cpp)
+  - .NET DLL/EXE     → <name>.cs         (e.g. test.dll → test.dll.cs)
+  - JAR / .class     → <name>.java       (e.g. test.jar → test.jar.java)
+  If file already exists, insert date: <name>.YYYYMMDD.<ext>
 """
 
 import argparse
@@ -87,17 +90,33 @@ def detect_type(path):
 
 # ── Output path helper ───────────────────────────────────────────────
 
-def output_path_for(input_path, output_dir):
-    """Return <output_dir>/<original_filename>.cpp"""
-    basename = Path(input_path).name  # keeps extension: test.dll → test.dll
-    return os.path.join(output_dir, basename + ".cpp")
+# Map file type to decompiled output extension
+TYPE_EXT_MAP = {
+    "elf": ".cpp",
+    "pe_native": ".cpp",
+    "dotnet": ".cs",
+    "jar": ".java",
+    "class": ".java",
+}
+
+
+def output_path_for(input_path, output_dir, file_type):
+    """Return output path: <name>.<ext> or <name>.YYYYMMDD.<ext> if exists."""
+    basename = Path(input_path).name
+    ext = TYPE_EXT_MAP.get(file_type, ".cpp")
+    out_path = os.path.join(output_dir, basename + ext)
+    if not os.path.exists(out_path):
+        return out_path
+    date_str = datetime.now().strftime("%Y%m%d")
+    out_path = os.path.join(output_dir, f"{basename}.{date_str}{ext}")
+    return out_path
 
 
 # ── Decompilers ──────────────────────────────────────────────────────
 
-def decompile_ghidra(input_path, output_dir):
+def decompile_ghidra(input_path, output_dir, file_type):
     """Decompile ELF or native PE using Ghidra headless."""
-    out_path = output_path_for(input_path, output_dir)
+    out_path = output_path_for(input_path, output_dir, file_type)
     os.makedirs(output_dir, exist_ok=True)
 
     # Ghidra exports to a temp path first
@@ -126,16 +145,16 @@ def decompile_ghidra(input_path, output_dir):
         return out_path
 
     # Fallback to RetDec
-    return decompile_retdec(input_path, output_dir)
+    return decompile_retdec(input_path, output_dir, file_type)
 
 
-def decompile_retdec(input_path, output_dir):
+def decompile_retdec(input_path, output_dir, file_type):
     """Fallback decompiler using RetDec."""
     if not RETDEC or not os.path.exists(RETDEC):
         print("[RetDec] Not available, skipping fallback", file=sys.stderr)
         return None
 
-    out_path = output_path_for(input_path, output_dir)
+    out_path = output_path_for(input_path, output_dir, file_type)
     cmd = [RETDEC, input_path, out_path]
     print(f"[RetDec] Decompiling {input_path} ...")
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -145,9 +164,9 @@ def decompile_retdec(input_path, output_dir):
     return out_path
 
 
-def decompile_ilspy(input_path, output_dir):
+def decompile_ilspy(input_path, output_dir, file_type):
     """Decompile .NET DLL/EXE using ILSpy CLI."""
-    out_path = output_path_for(input_path, output_dir)
+    out_path = output_path_for(input_path, output_dir, file_type)
     os.makedirs(output_dir, exist_ok=True)
 
     tmp_dir = os.path.join("/tmp", "ilspy_out")
@@ -171,9 +190,9 @@ def decompile_ilspy(input_path, output_dir):
     return None
 
 
-def decompile_cfr(input_path, output_dir):
-    """Decompile JAR or .class using CFR. Concatenate all .java into one .cpp."""
-    out_path = output_path_for(input_path, output_dir)
+def decompile_cfr(input_path, output_dir, file_type):
+    """Decompile JAR or .class using CFR. Concatenate all .java into one output."""
+    out_path = output_path_for(input_path, output_dir, file_type)
     os.makedirs(output_dir, exist_ok=True)
 
     tmp_dir = os.path.join("/tmp", "cfr_out")
@@ -239,7 +258,7 @@ def process_file(input_path, output_dir):
         return False
 
     decompiler_name, decompile_fn = DECOMPILER_MAP[file_type]
-    result_path = decompile_fn(input_path, output_dir)
+    result_path = decompile_fn(input_path, output_dir, file_type)
 
     if result_path and os.path.exists(result_path):
         write_metadata(input_path, output_dir, file_type, decompiler_name, result_path)
