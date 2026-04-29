@@ -2,14 +2,14 @@
 """Unified decompilation wrapper — runs inside Docker container.
 
 Detects file type via magic bytes and routes to the appropriate decompiler:
-  - ELF / native PE  → Ghidra headless (fallback: RetDec)
+  - ELF / native PE / COFF / ar archive → Ghidra headless (fallback: RetDec)
   - .NET DLL/EXE     → ILSpy CLI
   - JAR / .class     → CFR
 
 Output naming by file type:
-  - ELF / native PE  → <name>.cpp        (e.g. test → test.cpp)
-  - .NET DLL/EXE     → <name>.cs         (e.g. test.dll → test.dll.cs)
-  - JAR / .class     → <name>.java       (e.g. test.jar → test.jar.java)
+  - ELF / native PE / COFF / ar → <name>.cpp
+  - .NET DLL/EXE     → <name>.cs
+  - JAR / .class     → <name>.java
   If file already exists, insert date: <name>.YYYYMMDD.<ext>
 """
 
@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import struct
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +30,7 @@ ILSPYCMD = shutil.which("ilspy-cli") or "/opt/ilspy-cli/ilspy-cli"
 RETDEC = shutil.which("retdec-decompiler") or ""
 
 DEFAULT_OUTPUT_DIR = "/data/decompiled"
+GHIDRA_TIMEOUT = 1800  # 30 minutes for large binaries
 
 
 # ── File type detection ──────────────────────────────────────────────
@@ -39,15 +41,18 @@ def read_magic(path, n=8):
 
 
 def detect_type(path):
-    """Return one of: 'elf', 'pe_native', 'dotnet', 'jar', 'class', 'unknown'."""
+    """Return one of: 'elf', 'pe_native', 'dotnet', 'coff', 'ar_archive', 'jar', 'class', 'unknown'."""
     magic = read_magic(path, 8)
 
+    # ELF (includes .o, .so, executables)
     if magic[:4] == b"\x7fELF":
         return "elf"
 
+    # Java .class
     if magic[:4] == b"\xca\xfe\xba\xbe":
         return "class"
 
+    # ZIP-based (JAR / APK)
     if magic[:4] == b"PK\x03\x04":
         try:
             result = subprocess.run(
@@ -62,6 +67,18 @@ def detect_type(path):
             pass
         return "jar"
 
+    # ar archive (.a static lib, .lib import lib)
+    if magic[:8] == b"!<arch>\n":
+        return "ar_archive"
+
+    # COFF object file (.o for Windows, machine type in first 2 bytes)
+    # 0x014c = i386, 0x8664 = AMD64, 0x01c0 = ARM, 0xaa64 = ARM64
+    if len(magic) >= 2:
+        machine = struct.unpack("<H", magic[:2])[0]
+        if machine in (0x014c, 0x8664, 0x01c0, 0xaa64):
+            return "coff"
+
+    # PE (MZ header)
     if magic[:2] == b"MZ":
         try:
             with open(path, "rb") as f:
@@ -90,10 +107,11 @@ def detect_type(path):
 
 # ── Output path helper ───────────────────────────────────────────────
 
-# Map file type to decompiled output extension
 TYPE_EXT_MAP = {
     "elf": ".cpp",
     "pe_native": ".cpp",
+    "coff": ".cpp",
+    "ar_archive": ".cpp",
     "dotnet": ".cs",
     "jar": ".java",
     "class": ".java",
@@ -112,14 +130,65 @@ def output_path_for(input_path, output_dir, file_type):
     return out_path
 
 
+# ── ar archive extraction ────────────────────────────────────────────
+
+def is_coff_import_obj(path):
+    """Check if file is a COFF short import object (import stub, no real code)."""
+    try:
+        with open(path, "rb") as f:
+            sig1, sig2 = struct.unpack("<HH", f.read(4))
+        return sig1 == 0x0000 and sig2 == 0xFFFF
+    except Exception:
+        return False
+
+
+def parse_coff_import_symbols(path):
+    """Parse COFF import object, return (dll_name, [symbol_names])."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        # Skip header: Sig1(2) + Sig2(2) + Version(2) + Machine(2) +
+        # TimeDateStamp(4) + SizeOfData(4) + Ordinal/Hint(2) + Type(2) = 20 bytes
+        if len(data) < 20:
+            return None, []
+        size_of_data = struct.unpack("<I", data[12:16])[0]
+        # After 20-byte header: string data (DLL name + symbol names)
+        strings = data[20:20 + size_of_data]
+        parts = strings.split(b'\x00')
+        names = [p.decode('ascii', errors='replace') for p in parts if p]
+        dll_name = names[0] if names else "unknown"
+        symbols = names[1:]
+        return dll_name, symbols
+    except Exception:
+        return None, []
+
+
+def extract_ar_archive(archive_path):
+    """Extract ar archive to a temp dir, return list of member file paths."""
+    tmp_dir = tempfile.mkdtemp(prefix="ar_extract_")
+    result = subprocess.run(
+        ["ar", "x", archive_path],
+        cwd=tmp_dir, capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        print(f"[ar] Failed to extract {archive_path}: {result.stderr}", file=sys.stderr)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return []
+    members = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
+    return members, tmp_dir
+
+
 # ── Decompilers ──────────────────────────────────────────────────────
 
 def decompile_ghidra(input_path, output_dir, file_type):
-    """Decompile ELF or native PE using Ghidra headless."""
+    """Decompile ELF, native PE, COFF, or ar archive using Ghidra headless."""
+    # For ar archives, extract and decompile each member, then concatenate
+    if file_type == "ar_archive":
+        return decompile_ar_archive(input_path, output_dir)
+
     out_path = output_path_for(input_path, output_dir, file_type)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Ghidra exports to a temp path first
     tmp_out = os.path.join("/tmp", "ghidra_out.c")
     project_dir = "/tmp/ghidra_project"
     os.makedirs(project_dir, exist_ok=True)
@@ -134,11 +203,14 @@ def decompile_ghidra(input_path, output_dir, file_type):
     ]
 
     print(f"[Ghidra] Decompiling {input_path} ...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        print(f"[Ghidra] Warning: exit code {result.returncode}", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr[:2000], file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GHIDRA_TIMEOUT)
+        if result.returncode != 0:
+            print(f"[Ghidra] Warning: exit code {result.returncode}", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr[:2000], file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"[Ghidra] Timeout after {GHIDRA_TIMEOUT}s for {input_path}", file=sys.stderr)
 
     if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
         shutil.move(tmp_out, out_path)
@@ -146,6 +218,76 @@ def decompile_ghidra(input_path, output_dir, file_type):
 
     # Fallback to RetDec
     return decompile_retdec(input_path, output_dir, file_type)
+
+
+def decompile_ar_archive(archive_path, output_dir):
+    """Extract ar archive and decompile all members, concatenate into one output."""
+    out_path = output_path_for(archive_path, output_dir, "ar_archive")
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        members, tmp_dir = extract_ar_archive(archive_path)
+    except Exception as e:
+        print(f"[ar] Failed to extract {archive_path}: {e}", file=sys.stderr)
+        return None
+
+    if not members:
+        return None
+
+    all_output = []
+    import_symbols = []  # collect import stubs
+    for member_path in members:
+        member_type = detect_type(member_path)
+        member_name = os.path.basename(member_path)
+        print(f"[ar] Member {member_name} → {member_type}")
+
+        # COFF import stubs: no real code, just extract symbol names
+        if member_type == "unknown" and is_coff_import_obj(member_path):
+            dll_name, syms = parse_coff_import_symbols(member_path)
+            if syms:
+                import_symbols.append((dll_name, member_name, syms))
+            continue
+
+        if member_type in ("elf", "coff", "pe_native", "unknown"):
+            tmp_out = os.path.join("/tmp", f"ghidra_out_{member_name}.c")
+            project_dir = "/tmp/ghidra_project"
+            os.makedirs(project_dir, exist_ok=True)
+            cmd = [
+                os.path.join(GHIDRA_DIR, "support", "analyzeHeadless"),
+                project_dir, "decompile_project",
+                "-import", member_path,
+                "-scriptPath", os.path.join(GHIDRA_DIR, "ghidra_scripts"),
+                "-postScript", "ExportDecompiled.java", tmp_out,
+                "-deleteProject",
+            ]
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=GHIDRA_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                print(f"[Ghidra] Timeout for {member_path}", file=sys.stderr)
+            if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
+                all_output.append((member_name, tmp_out))
+
+    # Write output
+    has_content = False
+    with open(out_path, "w") as out_f:
+        for name, tmp_path in all_output:
+            has_content = True
+            out_f.write(f"// ===== {name} =====\n")
+            with open(tmp_path, "r", errors="replace") as in_f:
+                out_f.write(in_f.read())
+            out_f.write("\n\n")
+
+        if import_symbols:
+            has_content = True
+            out_f.write("// ===== Import Stubs (no decompilable code) =====\n\n")
+            for dll_name, member_name, syms in import_symbols:
+                out_f.write(f"// --- {member_name} (imports from {dll_name}) ---\n")
+                for sym in syms:
+                    out_f.write(f"//   {sym}\n")
+                out_f.write("\n")
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return out_path if has_content else None
 
 
 def decompile_retdec(input_path, output_dir, file_type):
@@ -157,9 +299,13 @@ def decompile_retdec(input_path, output_dir, file_type):
     out_path = output_path_for(input_path, output_dir, file_type)
     cmd = [RETDEC, input_path, out_path]
     print(f"[RetDec] Decompiling {input_path} ...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        print(f"[RetDec] Failed: exit code {result.returncode}", file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=GHIDRA_TIMEOUT)
+        if result.returncode != 0:
+            print(f"[RetDec] Failed: exit code {result.returncode}", file=sys.stderr)
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"[RetDec] Timeout for {input_path}", file=sys.stderr)
         return None
     return out_path
 
@@ -174,14 +320,17 @@ def decompile_ilspy(input_path, output_dir, file_type):
 
     cmd = [ILSPYCMD, input_path, tmp_dir]
     print(f"[ILSpy] Decompiling {input_path} ...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        print(f"[ILSpy] Failed: exit code {result.returncode}", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr[:2000], file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"[ILSpy] Failed: exit code {result.returncode}", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr[:2000], file=sys.stderr)
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"[ILSpy] Timeout for {input_path}", file=sys.stderr)
         return None
 
-    # ilspy-cli outputs a single .cs file
     cs_files = list(Path(tmp_dir).glob("*.cs"))
     if cs_files:
         shutil.move(str(cs_files[0]), out_path)
@@ -200,11 +349,15 @@ def decompile_cfr(input_path, output_dir, file_type):
 
     cmd = ["java", "-jar", CFR_JAR, input_path, "--outputdir", tmp_dir]
     print(f"[CFR] Decompiling {input_path} ...")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if result.returncode != 0:
-        print(f"[CFR] Failed: exit code {result.returncode}", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr[:2000], file=sys.stderr)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(f"[CFR] Failed: exit code {result.returncode}", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr[:2000], file=sys.stderr)
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"[CFR] Timeout for {input_path}", file=sys.stderr)
         return None
 
     java_files = sorted(Path(tmp_dir).rglob("*.java"))
@@ -243,6 +396,8 @@ def write_metadata(input_path, output_dir, file_type, decompiler, output_file):
 DECOMPILER_MAP = {
     "elf": ("Ghidra", decompile_ghidra),
     "pe_native": ("Ghidra", decompile_ghidra),
+    "coff": ("Ghidra", decompile_ghidra),
+    "ar_archive": ("Ghidra", decompile_ghidra),
     "dotnet": ("ILSpy", decompile_ilspy),
     "jar": ("CFR", decompile_cfr),
     "class": ("CFR", decompile_cfr),
@@ -273,6 +428,7 @@ def process_file(input_path, output_dir):
 
 SUPPORTED_EXTENSIONS = {
     ".elf", ".exe", ".dll", ".so", ".o", ".obj",
+    ".a", ".lib",
     ".jar", ".class", ".apk",
 }
 

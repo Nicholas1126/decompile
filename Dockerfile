@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # --- Base packages ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget curl unzip git python3 python3-pip xz-utils \
+    wget curl unzip git python3 python3-pip xz-utils binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # --- JDK 21 (Ghidra 11.2+ requires JDK 21) ---
