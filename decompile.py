@@ -132,14 +132,72 @@ def output_path_for(input_path, output_dir, file_type):
 
 # ── ar archive extraction ────────────────────────────────────────────
 
-def is_coff_import_obj(path):
-    """Check if file is a COFF short import object (import stub, no real code)."""
+def is_import_stub(path):
+    """Check if an object file is an import stub (jmp *[IAT], no real code).
+
+    Detects two forms:
+    1. COFF short import object (sig 0x0000 0xFFFF)
+    2. Regular COFF/ELF .o with only jmp *[0x0] in .text (import library member)
+    """
+    # Form 1: COFF short import object
     try:
         with open(path, "rb") as f:
             sig1, sig2 = struct.unpack("<HH", f.read(4))
-        return sig1 == 0x0000 and sig2 == 0xFFFF
+        if sig1 == 0x0000 and sig2 == 0xFFFF:
+            return True
     except Exception:
-        return False
+        pass
+
+    # Form 2: Check via objdump if .text only has indirect jump stubs
+    try:
+        result = subprocess.run(
+            ["objdump", "-d", path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            lines = result.stdout.splitlines()
+            # Look for actual instruction lines (indented, after <symbol>:)
+            instr_lines = [l for l in lines if l and l[0] == ' ' and ':' in l]
+            if not instr_lines:
+                return True
+            # If all instructions are jmp *[0x0] or nop, it's an import stub
+            for line in instr_lines:
+                code = line.split('\t')[-1].strip() if '\t' in line else ""
+                if code and code not in ("jmp", "nop", "xchg", "ret"):
+                    # Has a real instruction → not a stub
+                    if "jmp" not in code or "*0x0" not in code:
+                        return False
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def get_archive_symbols(archive_path):
+    """Use nm to list all symbols from an archive."""
+    try:
+        result = subprocess.run(
+            ["nm", "--defined-only", archive_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            # Try objdump as fallback
+            result = subprocess.run(
+                ["objdump", "-t", archive_path],
+                capture_output=True, text=True, timeout=30
+            )
+        if result.returncode == 0:
+            symbols = []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    sym = parts[-1]
+                    if sym and not sym.startswith('.') and sym != 'archive':
+                        symbols.append(sym)
+            return symbols
+    except Exception:
+        pass
+    return []
 
 
 def parse_coff_import_symbols(path):
@@ -147,12 +205,9 @@ def parse_coff_import_symbols(path):
     try:
         with open(path, "rb") as f:
             data = f.read()
-        # Skip header: Sig1(2) + Sig2(2) + Version(2) + Machine(2) +
-        # TimeDateStamp(4) + SizeOfData(4) + Ordinal/Hint(2) + Type(2) = 20 bytes
         if len(data) < 20:
             return None, []
         size_of_data = struct.unpack("<I", data[12:16])[0]
-        # After 20-byte header: string data (DLL name + symbol names)
         strings = data[20:20 + size_of_data]
         parts = strings.split(b'\x00')
         names = [p.decode('ascii', errors='replace') for p in parts if p]
@@ -163,18 +218,56 @@ def parse_coff_import_symbols(path):
         return None, []
 
 
+def objdump_disassemble(path):
+    """Get objdump disassembly output for an object file."""
+    try:
+        result = subprocess.run(
+            ["objdump", "-d", "-C", path],
+            capture_output=True, text=True, timeout=60
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return None
+
+
 def extract_ar_archive(archive_path):
     """Extract ar archive to a temp dir, return list of member file paths."""
     tmp_dir = tempfile.mkdtemp(prefix="ar_extract_")
+    # ar x may fail if members have subdirectory paths (e.g. tmp32/gost_sign.obj)
+    # First try plain extraction, then try with mkdir for each member
     result = subprocess.run(
         ["ar", "x", archive_path],
-        cwd=tmp_dir, capture_output=True, text=True, timeout=60
+        cwd=tmp_dir, capture_output=True, text=True, timeout=120
     )
+    if result.returncode != 0:
+        # List members and create subdirs before extracting
+        try:
+            list_result = subprocess.run(
+                ["ar", "t", archive_path],
+                capture_output=True, text=True, timeout=30
+            )
+            if list_result.returncode == 0:
+                for member_name in list_result.stdout.splitlines():
+                    member_name = member_name.strip()
+                    if '/' in member_name:
+                        subdir = os.path.join(tmp_dir, os.path.dirname(member_name))
+                        os.makedirs(subdir, exist_ok=True)
+                result = subprocess.run(
+                    ["ar", "x", archive_path],
+                    cwd=tmp_dir, capture_output=True, text=True, timeout=120
+                )
+        except Exception:
+            pass
     if result.returncode != 0:
         print(f"[ar] Failed to extract {archive_path}: {result.stderr}", file=sys.stderr)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return []
-    members = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)]
+    members = []
+    for root, dirs, files in os.walk(tmp_dir):
+        for f in files:
+            members.append(os.path.join(root, f))
     return members, tmp_dir
 
 
@@ -191,6 +284,8 @@ def decompile_ghidra(input_path, output_dir, file_type):
 
     tmp_out = os.path.join("/tmp", "ghidra_out.c")
     project_dir = "/tmp/ghidra_project"
+    # Clean project dir to avoid conflicts from previous runs
+    shutil.rmtree(project_dir, ignore_errors=True)
     os.makedirs(project_dir, exist_ok=True)
 
     cmd = [
@@ -221,7 +316,7 @@ def decompile_ghidra(input_path, output_dir, file_type):
 
 
 def decompile_ar_archive(archive_path, output_dir):
-    """Extract ar archive and decompile all members, concatenate into one output."""
+    """Extract ar archive, classify members, decompile real code, list import stubs."""
     out_path = output_path_for(archive_path, output_dir, "ar_archive")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -234,23 +329,53 @@ def decompile_ar_archive(archive_path, output_dir):
     if not members:
         return None
 
-    all_output = []
-    import_symbols = []  # collect import stubs
+    decompiled_output = []   # (member_name, content_string)
+    import_symbols = []      # (dll_name, member_name, [symbols])
+    stub_members = []        # import stub members with disassembly
+
     for member_path in members:
         member_type = detect_type(member_path)
         member_name = os.path.basename(member_path)
         print(f"[ar] Member {member_name} → {member_type}")
 
-        # COFF import stubs: no real code, just extract symbol names
-        if member_type == "unknown" and is_coff_import_obj(member_path):
+        # COFF short import object (no sections, just header + strings)
+        if member_type == "unknown" and is_import_stub(member_path):
             dll_name, syms = parse_coff_import_symbols(member_path)
             if syms:
                 import_symbols.append((dll_name, member_name, syms))
+            else:
+                # Try nm to get symbol name
+                nm_result = subprocess.run(
+                    ["nm", member_path], capture_output=True, text=True, timeout=10
+                )
+                if nm_result.returncode == 0 and nm_result.stdout.strip():
+                    syms = [l.split()[-1] for l in nm_result.stdout.splitlines() if l.strip()]
+                    import_symbols.append(("unknown", member_name, syms))
             continue
 
+        # Check if member is an import stub (has .text with only jmp *[IAT])
+        if is_import_stub(member_path):
+            # Get symbol name from objdump
+            disasm = objdump_disassemble(member_path)
+            if disasm:
+                stub_members.append((member_name, disasm))
+            # Also try nm
+            nm_result = subprocess.run(
+                ["nm", "--defined-only", member_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if nm_result.returncode == 0:
+                syms = [l.split()[-1] for l in nm_result.stdout.splitlines()
+                        if l.strip() and not l.strip().startswith('.')]
+                if syms:
+                    import_symbols.append(("unknown", member_name, syms))
+            continue
+
+        # Real code: decompile with Ghidra
         if member_type in ("elf", "coff", "pe_native", "unknown"):
             tmp_out = os.path.join("/tmp", f"ghidra_out_{member_name}.c")
             project_dir = "/tmp/ghidra_project"
+            shutil.rmtree(project_dir, ignore_errors=True)
             os.makedirs(project_dir, exist_ok=True)
             cmd = [
                 os.path.join(GHIDRA_DIR, "support", "analyzeHeadless"),
@@ -265,23 +390,34 @@ def decompile_ar_archive(archive_path, output_dir):
             except subprocess.TimeoutExpired:
                 print(f"[Ghidra] Timeout for {member_path}", file=sys.stderr)
             if os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 0:
-                all_output.append((member_name, tmp_out))
+                with open(tmp_out, "r", errors="replace") as f:
+                    decompiled_output.append((member_name, f.read()))
 
     # Write output
     has_content = False
     with open(out_path, "w") as out_f:
-        for name, tmp_path in all_output:
+        # Real decompiled code
+        for name, content in decompiled_output:
             has_content = True
-            out_f.write(f"// ===== {name} =====\n")
-            with open(tmp_path, "r", errors="replace") as in_f:
-                out_f.write(in_f.read())
+            out_f.write(f"// ===== {name} (decompiled) =====\n")
+            out_f.write(content)
             out_f.write("\n\n")
 
+        # Import stub disassembly
+        if stub_members:
+            has_content = True
+            out_f.write("// ===== Import Stubs (disassembly) =====\n\n")
+            for name, disasm in stub_members:
+                out_f.write(f"// --- {name} ---\n")
+                out_f.write(disasm)
+                out_f.write("\n")
+
+        # Symbol list summary
         if import_symbols:
             has_content = True
-            out_f.write("// ===== Import Stubs (no decompilable code) =====\n\n")
+            out_f.write("// ===== Import Symbol Table =====\n\n")
             for dll_name, member_name, syms in import_symbols:
-                out_f.write(f"// --- {member_name} (imports from {dll_name}) ---\n")
+                out_f.write(f"// DLL: {dll_name}  (from {member_name})\n")
                 for sym in syms:
                     out_f.write(f"//   {sym}\n")
                 out_f.write("\n")
