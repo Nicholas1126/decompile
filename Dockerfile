@@ -42,12 +42,11 @@ ENV CFR_VERSION=0.152
 RUN curl -fsSL -o /opt/cfr.jar "https://github.com/leuschner/cfr/releases/download/CFR_${CFR_VERSION}/cfr-${CFR_VERSION}.jar" \
     || curl -fsSL -o /opt/cfr.jar "https://www.benf.org/other/cfr/cfr-${CFR_VERSION}.jar"
 
-# --- RetDec (optional fallback for native binaries) ---
-RUN (curl -fsSL -o retdec.tar.xz "https://github.com/avast/retdec/releases/download/v5.0/RetDec-v5.0-Linux-Release.tar.xz" \
-    && tar -xf retdec.tar.xz -C /opt \
-    && mv /opt/RetDec /opt/retdec \
-    && rm retdec.tar.xz) \
-    || echo "RetDec skipped, Ghidra is primary"
+# --- RetDec (fallback for native binaries) ---
+RUN mkdir -p /opt/retdec \
+    && curl -fsSL -o retdec.tar.xz "https://github.com/avast/retdec/releases/download/v5.0/RetDec-v5.0-Linux-Release.tar.xz" \
+    && tar -xf retdec.tar.xz -C /opt/retdec \
+    && rm retdec.tar.xz
 ENV PATH="/opt/retdec/bin:${PATH}"
 
 # --- Ghidra export script ---
