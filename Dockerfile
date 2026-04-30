@@ -49,6 +49,14 @@ RUN mkdir -p /opt/retdec \
     && rm retdec.tar.xz
 ENV PATH="/opt/retdec/bin:${PATH}"
 
+# --- .NET Framework reference assemblies for ILSpy ---
+RUN mkdir -p /usr/lib/mono/4.7.2-api \
+    && curl -fsSL -o /tmp/netfx.nupkg "https://www.nuget.org/api/v2/package/Microsoft.NETFramework.ReferenceAssemblies.net472/1.0.3" \
+    && unzip -q /tmp/netfx.nupkg -d /tmp/netfx \
+    && cp -r /tmp/netfx/build/.NETFramework/v4.7.2/. /usr/lib/mono/4.7.2-api/ \
+    && for v in 4.0-api 4.5-api 4.5.1-api 4.5.2-api 4.6-api 4.6.1-api 4.6.2-api 4.7-api 4.7.1-api; do ln -sf /usr/lib/mono/4.7.2-api /usr/lib/mono/$v; done \
+    && rm -rf /tmp/netfx.nupkg /tmp/netfx
+
 # --- Ghidra export script ---
 RUN mkdir -p ${GHIDRA_DIR}/ghidra_scripts
 COPY ghidra_scripts/ExportDecompiled.java ${GHIDRA_DIR}/ghidra_scripts/
