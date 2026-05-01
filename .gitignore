@@ -14,5 +14,9 @@ test/
 .idea/
 
 # OS
+.DS_Store
 Thumbs.db
 Desktop.ini
+
+# Claude Code runtime files
+.claude/
