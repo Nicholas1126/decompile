@@ -2,26 +2,43 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Route apt downloads through local proxy on macOS host (192.168.65.2:3128)
+# which has direct access to mirrors blocked from Docker's VM network.
+# Use sg.archive.ubuntu.com (Singapore mirror, accessible from host).
+RUN printf 'deb [trusted=yes] http://sg.archive.ubuntu.com/ubuntu jammy main restricted universe multiverse\n\
+deb [trusted=yes] http://sg.archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse\n\
+deb [trusted=yes] http://sg.archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse\n\
+deb [trusted=yes] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse\n' \
+    > /etc/apt/sources.list \
+    && printf 'Acquire::http::Proxy "http://192.168.65.2:3128";\nAcquire::Retries "3";\n' \
+    > /etc/apt/apt.conf.d/80proxy \
+    && rm -f /etc/apt/apt.conf.d/docker-clean
+
 # --- Base packages ---
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update || true; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
     wget curl unzip git python3 python3-pip xz-utils binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # --- JDK 21 (Ghidra 11.2+ requires JDK 21) ---
-RUN apt-get update && apt-get install -y --no-install-recommends openjdk-21-jdk-headless \
-    && apt-get install -y --no-install-recommends libharfbuzz0b libfreetype6 fontconfig \
+RUN apt-get update || true; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+    openjdk-21-jdk-headless libharfbuzz0b libfreetype6 fontconfig \
     && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 
 # --- .NET SDK 8.0 (build ilspy-cli) ---
-RUN apt-get update && apt-get install -y --no-install-recommends dotnet-sdk-8.0 \
+RUN apt-get update || true; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated dotnet-sdk-8.0 \
     && rm -rf /var/lib/apt/lists/*
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 
 # --- Build ILSpy CLI from source ---
+# Limit GC heap to 512MB so dotnet build fits in Docker's 2GB VM limit
 COPY ilspy-cli/ /tmp/ilspy-cli/
 RUN cd /tmp/ilspy-cli \
-    && dotnet publish -c Release -o /opt/ilspy-cli \
+    && DOTNET_GCHeapHardLimit=536870912 DOTNET_GCConserveMemory=5 \
+       dotnet publish -c Release -o /opt/ilspy-cli \
     && rm -rf /tmp/ilspy-cli
 ENV PATH="/opt/ilspy-cli:${PATH}"
 
