@@ -41,15 +41,25 @@ def read_magic(path, n=8):
 
 
 def detect_type(path):
-    """Return one of: 'elf', 'pe_native', 'dotnet', 'coff', 'ar_archive', 'jar', 'class', 'unknown'."""
+    """Return one of: 'elf', 'macho', 'pe_native', 'dotnet', 'coff', 'ar_archive', 'jar', 'class', 'unknown'."""
     magic = read_magic(path, 8)
 
     # ELF (includes .o, .so, executables)
     if magic[:4] == b"\x7fELF":
         return "elf"
 
-    # Java .class
+    # Mach-O (macOS/iOS binaries)
+    if magic[:4] in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+                     b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"):
+        return "macho"
+
+    # Mach-O FAT / Java .class disambiguation — both start with 0xCAFEBABE
     if magic[:4] == b"\xca\xfe\xba\xbe":
+        # FAT: bytes 4-7 = nfat_arch (big-endian), typically 2-5
+        # Java class: bytes 4-5 = minor_version (usually 0), bytes 6-7 = major_version (45-67)
+        nfat = struct.unpack(">I", magic[4:8])[0]
+        if nfat < 20:
+            return "macho"
         return "class"
 
     # ZIP-based (JAR / APK)
@@ -109,6 +119,7 @@ def detect_type(path):
 
 TYPE_EXT_MAP = {
     "elf": ".cpp",
+    "macho": ".cpp",
     "pe_native": ".cpp",
     "coff": ".cpp",
     "ar_archive": ".cpp",
@@ -531,6 +542,7 @@ def write_metadata(input_path, output_dir, file_type, decompiler, output_file):
 
 DECOMPILER_MAP = {
     "elf": ("Ghidra", decompile_ghidra),
+    "macho": ("Ghidra", decompile_ghidra),
     "pe_native": ("Ghidra", decompile_ghidra),
     "coff": ("Ghidra", decompile_ghidra),
     "ar_archive": ("Ghidra", decompile_ghidra),
@@ -577,6 +589,9 @@ def should_process(path):
         try:
             magic = read_magic(path, 4)
             if magic[:4] == b"\x7fELF" or magic[:2] == b"MZ":
+                return True
+            if magic[:4] in (b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+                             b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"):
                 return True
         except Exception:
             pass
