@@ -2,6 +2,10 @@
 *.pyc
 __pycache__/
 
+# Pre-downloaded binaries and pre-built artifacts (large files, not for VCS)
+docker-downloads/
+ilspy-prebuilt/
+
 # Test binaries
 test/
 

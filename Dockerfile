@@ -27,48 +27,42 @@ RUN apt-get update || true; \
     && rm -rf /var/lib/apt/lists/*
 ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 
-# --- .NET SDK 8.0 (build ilspy-cli) ---
+# --- .NET SDK 8.0 (needed at runtime for ilspy-cli SelfContained=false) ---
 RUN apt-get update || true; \
     apt-get install -y --no-install-recommends --allow-unauthenticated dotnet-sdk-8.0 \
     && rm -rf /var/lib/apt/lists/*
 ENV DOTNET_CLI_TELEMETRY_OPTOUT=1
 
-# --- Build ILSpy CLI from source ---
-# Limit GC heap to 512MB so dotnet build fits in Docker's 2GB VM limit
-COPY ilspy-cli/ /tmp/ilspy-cli/
-RUN cd /tmp/ilspy-cli \
-    && DOTNET_GCHeapHardLimit=536870912 DOTNET_GCConserveMemory=5 \
-       dotnet publish -c Release -o /opt/ilspy-cli \
-    && rm -rf /tmp/ilspy-cli
+# --- ILSpy CLI (pre-built for linux-x64, built outside Docker due to seccomp restriction) ---
+COPY ilspy-prebuilt/ /opt/ilspy-cli/
+RUN chmod +x /opt/ilspy-cli/ilspy-cli
 ENV PATH="/opt/ilspy-cli:${PATH}"
 
-# --- Ghidra 11.2.1 ---
+# --- Ghidra 11.2.1 (pre-downloaded to avoid Docker network issues) ---
 ENV GHIDRA_VERSION=11.2.1
 ENV GHIDRA_DIR=/opt/ghidra
-RUN curl -fsSL -o ghidra.zip "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_20241105.zip" \
-    && unzip -q ghidra.zip -d /opt \
+COPY docker-downloads/ghidra.zip /tmp/ghidra.zip
+RUN unzip -q /tmp/ghidra.zip -d /opt \
     && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC ${GHIDRA_DIR} \
-    && rm ghidra.zip
+    && rm /tmp/ghidra.zip
 ENV PATH="${GHIDRA_DIR}/support:${PATH}"
 
 # Pre-configure Ghidra JDK path so headless mode works without TTY
 RUN sed -i 's|JAVA_HOME="$(java -cp "${LS_CPATH}" LaunchSupport "${INSTALL_DIR}" ${JAVA_TYPE_ARG} -save)"|if [ -n "$JAVA_HOME" ]; then echo "Using JAVA_HOME=$JAVA_HOME"; else JAVA_HOME="$(java -cp "${LS_CPATH}" LaunchSupport "${INSTALL_DIR}" ${JAVA_TYPE_ARG} -save)"; fi|' "${GHIDRA_DIR}/support/launch.sh"
 
-# --- CFR 0.152 ---
-ENV CFR_VERSION=0.152
-RUN curl -fsSL -o /opt/cfr.jar "https://github.com/leuschner/cfr/releases/download/CFR_${CFR_VERSION}/cfr-${CFR_VERSION}.jar" \
-    || curl -fsSL -o /opt/cfr.jar "https://www.benf.org/other/cfr/cfr-${CFR_VERSION}.jar"
+# --- CFR 0.152 (pre-downloaded) ---
+COPY docker-downloads/cfr.jar /opt/cfr.jar
 
-# --- RetDec (fallback for native binaries) ---
+# --- RetDec (pre-downloaded) ---
+COPY docker-downloads/retdec.tar.xz /tmp/retdec.tar.xz
 RUN mkdir -p /opt/retdec \
-    && curl -fsSL -o retdec.tar.xz "https://github.com/avast/retdec/releases/download/v5.0/RetDec-v5.0-Linux-Release.tar.xz" \
-    && tar -xf retdec.tar.xz -C /opt/retdec \
-    && rm retdec.tar.xz
+    && tar -xf /tmp/retdec.tar.xz -C /opt/retdec \
+    && rm /tmp/retdec.tar.xz
 ENV PATH="/opt/retdec/bin:${PATH}"
 
-# --- .NET Framework reference assemblies for ILSpy ---
+# --- .NET Framework reference assemblies for ILSpy (pre-downloaded) ---
+COPY docker-downloads/netfx.nupkg /tmp/netfx.nupkg
 RUN mkdir -p /usr/lib/mono/4.7.2-api \
-    && curl -fsSL -o /tmp/netfx.nupkg "https://www.nuget.org/api/v2/package/Microsoft.NETFramework.ReferenceAssemblies.net472/1.0.3" \
     && unzip -q /tmp/netfx.nupkg -d /tmp/netfx \
     && cp -r /tmp/netfx/build/.NETFramework/v4.7.2/. /usr/lib/mono/4.7.2-api/ \
     && for v in 4.0-api 4.5-api 4.5.1-api 4.5.2-api 4.6-api 4.6.1-api 4.6.2-api 4.7-api 4.7.1-api; do ln -sf /usr/lib/mono/4.7.2-api /usr/lib/mono/$v; done \
